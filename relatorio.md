@@ -204,7 +204,75 @@ O protocolo Double Ratchet garante forward secrecy a dois níveis:
 | Autenticação de mensagem | AES-GCM (AAD) | Header do ratchet e identidade do remetente em grupos autenticados pelo MAC |
 | HMAC | HMAC-SHA256 | Resposta ao desafio de login |
 
-### 4.2 Garantias de Segurança
+### 4.2 Justificação e Comparação das Primitivas Escolhidas
+
+#### X25519 vs. alternativas de troca de chaves (RSA, P-256, DH clássico)
+
+Para a troca de chaves foi escolhido **X25519 (ECDH sobre Curve25519)**. As alternativas mais comuns seriam RSA (com cifra assimétrica direta), ECDH sobre curvas NIST como P-256, ou Diffie-Hellman clássico sobre grupos multiplicativos (FFDH).
+
+O RSA foi descartado desde o início porque não oferece forward secrecy de forma nativa — se a chave privada for comprometida, todo o histórico de comunicações pode ser decifrado retroativamente. Além disso, para níveis de segurança equivalentes, as chaves RSA são ordens de magnitude maiores (2048–4096 bits vs. 32 bytes do X25519), tornando-o menos eficiente.
+
+O FFDH clássico tem os mesmos problemas de dimensão de chave e é vulnerável a ataques de Logjam quando grupos estandardizados são reutilizados entre implementações.
+
+O P-256 (secp256r1) seria uma alternativa razoável em termos de segurança, mas a Curve25519 apresenta vantagens importantes: a sua implementação é resistente a ataques de timing por design (sem necessidade de operações condicionais secretas), os parâmetros da curva foram gerados de forma transparente e verificável (ao contrário do P-256, cujos parâmetros NIST levantam dúvidas históricas sobre possível backdoor), e a performance é superior. Por estas razões, o X25519 é hoje a escolha preferida em protocolos modernos como TLS 1.3, Signal e WireGuard.
+
+#### AES-256-GCM vs. alternativas de cifragem simétrica (AES-CBC, ChaCha20-Poly1305, AES-CTR)
+
+Para cifragem simétrica foi escolhido **AES-256-GCM**. As alternativas principais seriam AES-CBC (com HMAC separado), AES-CTR (sem autenticação), ou ChaCha20-Poly1305.
+
+O AES-CBC com HMAC separado é um padrão antigo que exige implementar corretamente o esquema MAC-then-Encrypt vs. Encrypt-then-MAC — uma fonte histórica de vulnerabilidades graves como o ataque BEAST e ataques de padding oracle. O AES-GCM integra autenticação e cifragem numa só operação (AEAD), eliminando esta classe de erros.
+
+O AES-CTR sem autenticação foi excluído por razões óbvias: não oferece integridade nem autenticidade, permitindo a um atacante alterar bits do ciphertext de forma controlada.
+
+O ChaCha20-Poly1305 seria uma alternativa moderna igualmente válida em termos de segurança, com a vantagem de ser mais eficiente em hardware sem instruções AES-NI. No entanto, o AES-256-GCM beneficia de aceleração por hardware em praticamente todos os processadores modernos (via AES-NI), o que o torna igualmente rápido na prática, e a sua suporte na biblioteca `cryptography` do Python é igualmente maduro e auditado.
+
+A variante AES-**256** (vs. AES-128) foi escolhida para oferecer margem de segurança adicional, especialmente relevante no contexto de chaves derivadas de passwords ou shared secrets.
+
+#### HKDF-SHA256 vs. alternativas de derivação de chave (KDF direta, concatenação simples, PBKDF2 para chaves efémeras)
+
+O **HKDF (HMAC-based Key Derivation Function)** com SHA-256 é o padrão recomendado pelo NIST (RFC 5869) para derivação de chaves a partir de material de alta entropia como shared secrets ECDH.
+
+A alternativa de usar o output ECDH diretamente como chave AES seria incorreta: o output de X25519 não está uniformemente distribuído no espaço de chaves AES e pode ter estrutura que um adversário poderia explorar. O HKDF aplica um passo de extração (HMAC-SHA256 com salt) seguido de expansão, produzindo bytes pseudoaleatórios de alta qualidade.
+
+O uso de SHA-256 (em vez de SHA-512 ou SHA-3) é suficiente para os 256 bits de segurança pretendidos, e a sua implementação é amplamente auditada e eficiente.
+
+O PBKDF2 é reservado exclusivamente para situações onde o material de entrada tem baixa entropia (passwords humanas), onde o seu custo computacional elevado é uma vantagem que torna ataques de força bruta economicamente proibitivos. Usar PBKDF2 para chaves efémeras seria desnecessariamente lento sem qualquer benefício.
+
+#### PBKDF2-SHA256 (600 000 iterações) vs. alternativas de hash de password (bcrypt, scrypt, Argon2, SHA-256 simples)
+
+Para proteção de passwords foi escolhido **PBKDF2-SHA256 com 600 000 iterações**. As alternativas modernas incluem bcrypt, scrypt e Argon2id.
+
+Um hash simples como SHA-256 foi excluído imediatamente: sem custo computacional deliberado, um atacante com GPU pode testar biliões de passwords por segundo.
+
+O bcrypt é um algoritmo maduro e bem estudado, mas tem um limite de 72 caracteres de password e não permite configurar o uso de memória (tornando-o mais vulnerável a ataques com hardware paralelo como FPGAs e ASICs).
+
+O scrypt e o Argon2id são superiores ao PBKDF2 em resistência a hardware especializado, pois incorporam também um parâmetro de custo de memória que dificulta a paralelização. Seriam escolhas ideais num sistema de produção.
+
+A razão pela qual o PBKDF2 foi mantido é que é o algoritmo disponível nativamente na biblioteca `cryptography` do Python sem dependências adicionais, e com 600 000 iterações (o valor recomendado pelo OWASP em 2023 para PBKDF2-SHA256) oferece proteção adequada no contexto deste projeto. O salt aleatório de 16 bytes por utilizador garante que dois utilizadores com a mesma password produzem hashes diferentes, eliminando ataques de rainbow table.
+
+#### Ed25519 vs. alternativas de assinatura digital (RSA-PSS, ECDSA P-256, RSA-PKCS1)
+
+Para assinaturas digitais (certificados CA e autenticação do servidor) foi escolhido **Ed25519**.
+
+O RSA-PKCS1 é considerado legado — é vulnerável a ataques de bleichenbacher e não oferece forward secrecy. O RSA-PSS é mais seguro mas ainda sofre dos problemas de dimensão de chave e performance.
+
+O ECDSA sobre P-256 tem um problema crítico: a sua segurança depende da qualidade do gerador de números aleatórios no momento da assinatura. Se o nonce usado na assinatura for previsível ou reutilizado, a chave privada pode ser recuperada — esta vulnerabilidade foi explorada em vários ataques reais, incluindo na Sony PlayStation 3. O Ed25519, por ser um esquema determinístico (EdDSA), elimina completamente este risco: o nonce é derivado deterministicamente da chave privada e da mensagem, sem necessidade de aleatoriedade no ato de assinar.
+
+Ed25519 oferece ainda chaves de apenas 32 bytes, assinaturas de 64 bytes, verificação extremamente rápida, e resistência a ataques de timing por design. É hoje o esquema de assinatura preferido em protocolos modernos.
+
+#### Double Ratchet vs. alternativas de protocolo de mensagens (TLS puro, PGP, SRP, cifra estática de sessão)
+
+O **Double Ratchet** é a escolha nuclear deste sistema, e é o que o distingue de implementações mais simples.
+
+Uma abordagem ingénua seria cifrar todas as mensagens com uma chave de sessão estática derivada no início da conversa. Esta abordagem é simples mas catastrófica do ponto de vista de segurança: se a chave de sessão for descoberta, todas as mensagens passadas e futuras ficam expostas.
+
+O PGP (usado para email cifrado) usa cifra de mensagem com a chave pública do destinatário diretamente, sem forward secrecy e sem proteção contra replay. O histórico de comunicações fica exposto se a chave privada for comprometida.
+
+O TLS oferece forward secrecy ao nível da sessão de transporte, mas não ao nível das mensagens individuais dentro de uma sessão: se o canal TLS for decifrado, todas as mensagens da sessão ficam expostas.
+
+O Double Ratchet combina um **ratchet DH** (que rota as chaves de sessão a cada nova ronda, garantindo *break-in recovery*) com um **ratchet simétrico** (que gera uma chave única por mensagem, garantindo que comprometer uma mensagem não compromete as anteriores ou as seguintes). Esta combinação fornece simultaneamente **forward secrecy** e **break-in recovery**, propriedades que nenhuma das alternativas acima oferece de forma completa. É exatamente o protocolo usado pelo Signal, WhatsApp e outros sistemas de mensagens seguros de referência.
+
+### 4.3 Garantias de Segurança
 
 **Confidencialidade:** As mensagens são cifradas ponta-a-ponta com AES-256-GCM. O servidor recebe apenas texto cifrado e nunca tem acesso às chaves de sessão, que são derivadas localmente nos clientes via ECDH.
 
@@ -228,7 +296,7 @@ O protocolo Double Ratchet garante forward secrecy a dois níveis:
 
 **Autenticidade nas mensagens de grupo:** O `username` do remetente e o número de sequência são usados como AAD no AES-GCM, impedindo que um membro se faça passar por outro ou reutilize mensagens antigas.
 
-### 4.3 Modelo de Ameaça
+### 4.4 Modelo de Ameaça
 
 O sistema foi desenhado para resistir a:
 
