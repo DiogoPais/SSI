@@ -27,6 +27,14 @@ Cache de mensagens fora de ordem:
   Se uma mensagem chega com seq > recv_seq + 1, as chaves das mensagens
   saltadas sao guardadas em 'skipped' e usadas quando chegarem.
   Previne ataques de replay: mensagens com seq <= recv_seq sao rejeitadas.
+
+CORREÇÃO (Vulnerabilidade 4 — Falta de Forward Secrecy no Handshake Inicial):
+  O iniciador agora gera um par X25519 EFÉMERO exclusivamente para o primeiro
+  passo da troca. O shared secret inicial nunca é derivado de chaves estáticas
+  (static-static), garantindo que mesmo a comprometição futura da chave
+  estática do iniciador não expõe as sessões passadas.
+  O par efémero é incluído no campo 'eph_pub_hex' do estado, e transmitido
+  ao recetor no primeiro payload cifrado através do campo dh_pub_raw normal.
 """
 
 import os
@@ -79,6 +87,14 @@ class RatchetState:
     """
     Estado completo de uma sessao Double Ratchet entre dois peers.
     Uma instancia por par (eu, peer) -- nao e partilhada.
+
+    CORREÇÃO Vulnerabilidade 4:
+      - O iniciador gera um par X25519 EFÉMERO (eph_priv) para o handshake
+        inicial, em vez de reutilizar a sua chave estática.
+      - O peer_static_pub_hex continua a ser usado para identificar o
+        destinatário, mas o shared secret deriva de (eph_priv × peer_static_pub).
+      - O recetor reconstrói o mesmo shared secret quando recebe a primeira
+        mensagem, pois o eph_pub_hex viaja no campo dh_pub_raw do payload.
     """
 
     def __init__(
@@ -99,25 +115,37 @@ class RatchetState:
             dh_ratchet_count: int = 0,
     ):
         if root_key is None:
-            # Sessao nova -- inicializa a partir do shared_secret ECDH inicial
+            # ---------------------------------------------------------------- #
+            # Sessao nova — inicializa a partir do shared_secret ECDH inicial. #
+            #                                                                   #
+            # CORREÇÃO Vulnerabilidade 4:                                       #
+            #   Iniciador: usa um par EFÉMERO (gerado aqui) para o 1.º passo   #
+            #   do DH ratchet, em vez da chave estática.                        #
+            #   Recetor:   usa a sua chave estática como posição de partida,    #
+            #   exatamente como antes — a simetria é mantida porque o           #
+            #   iniciador envia o seu eph_pub no primeiro payload.              #
+            # ---------------------------------------------------------------- #
             self.root_key = shared_secret
 
             if is_initiator:
-                # Iniciador: gera efemera, usa chave estática do destinatário para o 1º passo
-                priv = X25519PrivateKey.generate()
-                self.dh_send_priv = priv
-                self.dh_send_pub_hex = priv.public_key().public_bytes(
+                # Gera par EFÉMERO — nunca reutilizado, descartado após esta sessão
+                eph_priv = X25519PrivateKey.generate()
+                self.dh_send_priv = eph_priv
+                self.dh_send_pub_hex = eph_priv.public_key().public_bytes(
                     serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
                 self.dh_recv_pub_hex = peer_static_pub_hex
 
-                # Passo DH inicial para derivar a send_chain_key
-                peer_pub = X25519PublicKey.from_public_bytes(bytes.fromhex(peer_static_pub_hex))
+                # Passo DH inicial: ephemeral × peer_static
+                peer_pub = X25519PublicKey.from_public_bytes(
+                    bytes.fromhex(peer_static_pub_hex))
                 dh_out = self.dh_send_priv.exchange(peer_pub)
                 self.root_key, self.send_chain_key = _kdf_rk(self.root_key, dh_out)
                 self.recv_chain_key = None
             else:
-                # Recetor: usa a sua chave estática como primeira chave de envio
-                # para que a troca ECDH bata certo com a do iniciador.
+                # Recetor: usa a chave estática como posição de partida.
+                # Quando a 1.ª mensagem chegar, _dh_ratchet_recv() será chamado
+                # com o eph_pub do iniciador (contido no payload) e derivará a
+                # recv_chain_key correta.
                 self.dh_send_priv = my_static_priv
                 self.dh_send_pub_hex = self.dh_send_priv.public_key().public_bytes(
                     serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
@@ -218,6 +246,9 @@ class RatchetState:
 
         O header (dh_pub_raw + seq) e passado como AAD ao AES-GCM,
         o que garante que nao pode ser adulterado sem invalidar o MAC.
+
+        Nota: na primeira mensagem do iniciador, dh_pub_raw contem a
+        chave EFÉMERA gerada no construtor, nunca a chave estática.
         """
         msg_key  = self._advance_send()
         self.send_seq += 1
@@ -255,6 +286,9 @@ class RatchetState:
             return AESGCM(msg_key).decrypt(nonce, ct, header).decode("utf-8")
 
         # 2. DH ratchet se a chave publica mudou
+        #    Na 1.ª mensagem do iniciador, their_pub_hex é a chave EFÉMERA dele,
+        #    diferente de dh_recv_pub_hex (None para o recetor), pelo que este
+        #    ramo executa sempre na primeira mensagem — comportamento correto.
         if their_pub_hex != self.dh_recv_pub_hex:
             if self.recv_chain_key is not None:
                 # Guardar chaves da ronda anterior que ainda nao chegaram

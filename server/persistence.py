@@ -5,6 +5,12 @@ Guardar e carregar o estado cifrado do servidor em disco.
 
 O ficheiro é cifrado com AES-GCM, cuja chave é derivada via PBKDF2
 a partir da password mestre do servidor.
+
+CORREÇÃO Vulnerabilidade 1:
+  O esquema de users_db foi atualizado: os campos 'salt' e 'hash'
+  (derivados da password do cliente) foram substituídos por 'auth_pub_key'
+  (chave pública Ed25519 de autenticação do cliente).
+  O servidor nunca mais armazena qualquer derivado da password do utilizador.
 """
 
 import os
@@ -26,7 +32,16 @@ def salvar_estado(master_password: str,
                   users_db: dict,
                   offline_queue: dict,
                   groups: dict) -> None:
-    """Serializa e cifra todo o estado do servidor para DB_FILE."""
+    """
+    Serializa e cifra todo o estado do servidor para DB_FILE.
+
+    CORREÇÃO Vulnerabilidade 1:
+      Cada entrada em users_db contém agora:
+        • 'auth_pub_key' (str hex) — chave pública Ed25519 do utilizador
+        • 'chat_pub_key' (str hex) — chave pública X25519 de chat
+        • 'cert'         (str)     — certificado emitido pela CA interna
+      Os campos 'salt' e 'hash' foram removidos.
+    """
     estado = {
         "server_priv_key": server_priv_key.private_bytes(
             serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
@@ -37,9 +52,8 @@ def salvar_estado(master_password: str,
         "jwt_secret":   jwt_secret.hex(),
         "users_db": {
             u: {
-                "salt":         d["salt"].hex(),
-                "hash":         d["hash"].hex(),
-                "chat_pub_key": d["chat_pub_key"],
+                "auth_pub_key": d["auth_pub_key"],   # Ed25519 pública (hex)
+                "chat_pub_key": d["chat_pub_key"],   # X25519  pública (hex)
                 "cert":         d.get("cert", ""),
             }
             for u, d in users_db.items()
@@ -72,11 +86,17 @@ def carregar_estado(master_password: str) -> dict:
 
 
 def reconstruir_users_db(raw: dict) -> dict:
-    """Converte os campos hex do users_db de volta para bytes."""
+    """
+    Converte o users_db serializado de volta para o formato em memória.
+
+    CORREÇÃO Vulnerabilidade 1:
+      Deixou de converter campos hex para bytes (salt/hash foram removidos).
+      Todos os campos são agora strings hex ou strings simples — nenhuma
+      conversão para bytes é necessária nesta camada.
+    """
     return {
         u: {
-            "salt":         bytes.fromhex(d["salt"]),
-            "hash":         bytes.fromhex(d["hash"]),
+            "auth_pub_key": d["auth_pub_key"],
             "chat_pub_key": d["chat_pub_key"],
             "cert":         d.get("cert", ""),
         }

@@ -144,14 +144,16 @@ async def handler(websocket):
                 if resposta.get("status") == "ok":
                     username_ligado = msg.get("username")
                     users_ativos[username_ligado] = websocket
-                    pendentes = offline_queue.pop(username_ligado, [])
-                    if pendentes:
-                        print(f"[SERVIDOR] A entregar {len(pendentes)} msgs "
-                              f"offline a '{username_ligado}'.")
-                        for mp in pendentes:
-                            await websocket.send(json.dumps(mp))
-                        _salvar()
                 continue
+
+            elif action == "ready":
+                pendentes = offline_queue.pop(username_ligado, [])
+                if pendentes:
+                    print(f"[SERVIDOR] A entregar {len(pendentes)} msgs "
+                          f"offline a '{username_ligado}'.")
+                    for mp in pendentes:
+                        await websocket.send(json.dumps(mp))
+                    _salvar()
 
             elif action == "get_key":
                 resposta = handle_get_key(msg, users_db, JWT_SECRET_KEY)
@@ -183,6 +185,14 @@ async def handler(websocket):
 
             elif action == "ping":
                 resposta = {"status": "ok", "message": "Pong!"}
+
+
+            elif action == "logout":
+                if username_ligado and users_ativos.get(username_ligado) is websocket:
+                    del users_ativos[username_ligado]
+                    username_ligado = None
+                resposta = {"status": "ok", "message": "Sessão terminada no servidor."}
+
 
             else:
                 resposta = {"status": "error", "reason": "Action desconhecida."}
