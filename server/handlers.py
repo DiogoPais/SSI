@@ -84,7 +84,6 @@ def handle_create_group(msg: dict,
         "creator":    creator,
     }
 
-    # Enviar convite automático a cada membro (online ou offline)
     for m in members:
         if m == creator:
             continue

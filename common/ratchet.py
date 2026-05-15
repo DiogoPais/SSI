@@ -27,14 +27,6 @@ Cache de mensagens fora de ordem:
   Se uma mensagem chega com seq > recv_seq + 1, as chaves das mensagens
   saltadas sao guardadas em 'skipped' e usadas quando chegarem.
   Previne ataques de replay: mensagens com seq <= recv_seq sao rejeitadas.
-
-CORREÇÃO (Vulnerabilidade 4 — Falta de Forward Secrecy no Handshake Inicial):
-  O iniciador agora gera um par X25519 EFÉMERO exclusivamente para o primeiro
-  passo da troca. O shared secret inicial nunca é derivado de chaves estáticas
-  (static-static), garantindo que mesmo a comprometição futura da chave
-  estática do iniciador não expõe as sessões passadas.
-  O par efémero é incluído no campo 'eph_pub_hex' do estado, e transmitido
-  ao recetor no primeiro payload cifrado através do campo dh_pub_raw normal.
 """
 
 import os
@@ -87,14 +79,6 @@ class RatchetState:
     """
     Estado completo de uma sessao Double Ratchet entre dois peers.
     Uma instancia por par (eu, peer) -- nao e partilhada.
-
-    CORREÇÃO Vulnerabilidade 4:
-      - O iniciador gera um par X25519 EFÉMERO (eph_priv) para o handshake
-        inicial, em vez de reutilizar a sua chave estática.
-      - O peer_static_pub_hex continua a ser usado para identificar o
-        destinatário, mas o shared secret deriva de (eph_priv × peer_static_pub).
-      - O recetor reconstrói o mesmo shared secret quando recebe a primeira
-        mensagem, pois o eph_pub_hex viaja no campo dh_pub_raw do payload.
     """
 
     def __init__(
@@ -203,6 +187,7 @@ class RatchetState:
         self.root_key, self.send_chain_key = _kdf_rk(self.root_key, dh_out2)
 
         self.recv_seq = 0
+        self.send_seq = 0
         self.dh_ratchet_count += 1
 
     # ---- Symmetric Ratchet -------------------------------------------- #

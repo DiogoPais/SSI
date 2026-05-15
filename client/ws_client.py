@@ -5,36 +5,6 @@ Classe ClienteWS: toda a lógica de rede e criptografia do cliente.
 
 Separa claramente o "quê" (protocolo, sessões ratchet, grupos, P2P)
 do "como" se interage (CLI, que fica em cli.py).
-
-CORREÇÕES APLICADAS:
-  Vulnerabilidade 1 — Pass-the-Hash / Autenticação insegura:
-    • registar(): gera par Ed25519 de autenticação; envia apenas a chave
-      pública para o servidor (nunca qualquer derivado da password).
-    • login(): carrega a chave privada Ed25519 do disco, assina o desafio
-      com ela, envia a assinatura cifrada para o servidor.
-
-  Vulnerabilidade 2 — Downgrade Attack / TOFU:
-    • _processar_deliver() e enviar_msg(): remoção completa do fallback TOFU.
-      Se o certificado estiver ausente ou falhar a validação PKI, a operação
-      é rejeitada imediatamente com erro.
-
-  Vulnerabilidade 3 — Forward Secrecy em Grupos:
-    • criar_grupo(): a group_key é cifrada com ECDH efémero por membro
-      (cifrar_chave_grupo), em vez de estático-estático. A chave efémera
-      é gerada e descartada por cada key_share — comprometer a chave
-      estática do membro no futuro não expõe group_keys passadas.
-    • _processar_group_invite(): decifra com decifrar_chave_grupo() usando
-      a chave estática X25519 local. Não exige sessão Ratchet prévia,
-      pelo que funciona para qualquer membro, mesmo sem histórico de chat.
-
-  Vulnerabilidade 4 — Falta de Forward Secrecy no Handshake Inicial:
-    • enviar_msg() e _processar_deliver(): a sessão Ratchet é criada com
-      iniciar_sessao_ratchet() que já não recebe nem calcula um shared_secret
-      estático. O RatchetState gera internamente um par efémero (iniciador).
-
-  Vulnerabilidade 5 — PKI não usada para autorização:
-    • O fluxo de login usa agora Ed25519 para provar identidade antes de
-      obter o JWT, vinculando criptograficamente a identidade ao token.
 """
 
 import os
@@ -78,7 +48,7 @@ class ClienteWS:
 
         self.identity_priv:    X25519PrivateKey | None  = None
         self.identity_pub_hex: str | None               = None
-        self.auth_priv:        Ed25519PrivateKey | None = None  # NOVO: chave Ed25519
+        self.auth_priv:        Ed25519PrivateKey | None = None
         self.my_cert:          str                      = ""
         self.sessions:         dict[str, RatchetState]  = {}
         self.trusted_keys:     dict[str, str]           = {}
@@ -90,6 +60,7 @@ class ClienteWS:
 
         # P2P
         self._p2p_server = None
+        self._p2p_port = 0
         self._p2p_peers: dict[str, websockets.WebSocketClientProtocol] = {}
         self._expected_p2p_tokens: dict[str, str] = {}
 
@@ -147,7 +118,8 @@ class ClienteWS:
             self._escuta_task.cancel()
         if self._p2p_server:
             self._p2p_server.close()
-        for ws in self._p2p_peers.values():
+            await self._p2p_server.wait_closed()
+        for ws in list(self._p2p_peers.values()):
             await ws.close()
         if self.ws:
             await self.ws.close()
@@ -183,14 +155,6 @@ class ClienteWS:
     async def _processar_deliver(self, msg: dict):
         """
         Processa mensagem direta recebida via push do servidor.
-
-        CORREÇÃO Vulnerabilidade 2 — Remoção total do TOFU:
-          Se o certificado estiver ausente ou inválido, a mensagem é
-          descartada. Não existe qualquer fallback TOFU.
-
-        CORREÇÃO Vulnerabilidade 4 — Handshake sem static-static:
-          A sessão é iniciada com iniciar_sessao_ratchet() sem shared_secret
-          estático; o RatchetState trata do par efémero internamente.
         """
         remetente    = msg["from"]
         peer_pub_hex = msg.get("pub_key")
@@ -286,14 +250,6 @@ class ClienteWS:
     async def _processar_group_invite(self, msg: dict):
         """
         Processa convite de grupo recebido via push.
-
-        CORREÇÃO Vulnerabilidade 3 — Forward Secrecy em Grupos (sem pré-requisito):
-          O key_share foi cifrado pelo criador com ECDH efémero one-shot
-          (eph_priv × our_static_pub). Decifra-se com decifrar_chave_grupo(),
-          que realiza our_static_priv × eph_pub para reconstruir o shared
-          secret e recuperar a group_key.
-
-          Não é necessária qualquer sessão Ratchet prévia com o criador.
         """
         group_id  = msg["group_id"]
         nome      = msg["name"]
@@ -369,7 +325,7 @@ class ClienteWS:
             print(f"\n[P2P] Erro ao desencriptar: {e}")
         print("> ", end="", flush=True)
 
-    async def iniciar_p2p_server(self, porta: int = 9000) -> int:
+    async def iniciar_p2p_server(self, porta: int = 0) -> int:
         """Inicia servidor WebSocket local para ligações P2P diretas."""
 
         async def p2p_handler(ws):
@@ -407,9 +363,22 @@ class ClienteWS:
                 if peer:
                     self._p2p_peers.pop(peer, None)
 
-        self._p2p_server = await websockets.serve(p2p_handler, "localhost", porta)
-        print(f"[P2P] Servidor P2P local em ws://localhost:{porta}")
-        return porta
+        try:
+            self._p2p_server = await websockets.serve(p2p_handler, "localhost", porta)
+
+            if porta == 0 and self._p2p_server.sockets:
+                porta = self._p2p_server.sockets[0].getsockname()[1]
+
+            self._p2p_port = porta
+            print(f"[P2P] Servidor P2P local em ws://localhost:{porta}")
+            return porta
+
+        except OSError:
+            print(f"\n[ERRO P2P] A porta {porta} já está a ser usada por outro utilizador!")
+            print(
+                "[DICA] Inicie com outra porta (ex: 'p2p start 9001') ou use 'p2p start 0' para encontrar uma porta livre automaticamente.")
+            self._p2p_server = None
+            return -1
 
     async def convidar_p2p(self, token: str, peer: str, porta: int) -> dict:
         p2p_secret = secrets.token_hex(16)
@@ -431,6 +400,29 @@ class ClienteWS:
         }))
         return {"status": "ok", "message": "Enviado via P2P."}
 
+    async def parar_p2p_server(self) -> dict:
+        """Para o servidor P2P local e fecha todas as ligações diretas."""
+        fechou_algo = False
+
+        if self._p2p_server:
+            self._p2p_server.close()
+            await self._p2p_server.wait_closed()
+            self._p2p_server = None
+            fechou_algo = True
+            self._p2p_port = 0
+
+        if self._p2p_peers:
+            for p2p_ws in list(self._p2p_peers.values()):
+                await p2p_ws.close()
+            self._p2p_peers.clear()
+            self._expected_p2p_tokens.clear()
+            fechou_algo = True
+
+        if fechou_algo:
+            return {"status": "ok", "message": "Servidor e ligações P2P encerrados."}
+        else:
+            return {"status": "error", "reason": "Não há nenhum servidor ou ligação P2P ativa."}
+
     # ------------------------------------------------------------------ #
     #  Registo e login                                                     #
     # ------------------------------------------------------------------ #
@@ -438,26 +430,18 @@ class ClienteWS:
     async def registar(self, username: str, password: str) -> dict:
         """
         Regista nova conta no servidor.
-
-        CORREÇÃO Vulnerabilidade 1:
-          Gera um par Ed25519 EXCLUSIVO para autenticação (auth_priv/auth_pub).
-          Envia apenas auth_pub_key + chat_pub_key para o servidor — NUNCA
-          envia nem salt nem qualquer derivado da password.
         """
         if self._token is not None or self._username_atual is not None:
             return {"status": "error", "reason": "Já existe uma sessão ativa. Faça logout primeiro."}
 
-        # Par X25519 para chat (Double Ratchet)
         self.identity_priv    = X25519PrivateKey.generate()
         self.identity_pub_hex = self.identity_priv.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
 
-        # Par Ed25519 EXCLUSIVO para autenticação — NOVO
         self.auth_priv = Ed25519PrivateKey.generate()
         auth_pub_hex   = self.auth_priv.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
 
-        # Envia apenas as chaves públicas; zero informação sobre a password
         payload          = {
             "auth_pub_key": auth_pub_hex,
             "chat_pub_key": self.identity_pub_hex,
@@ -483,13 +467,6 @@ class ClienteWS:
     async def login(self, username: str, password: str) -> dict:
         """
         Autentica com challenge-response Ed25519.
-
-        CORREÇÃO Vulnerabilidade 1 + 5:
-          1. Pede desafio ao servidor.
-          2. Carrega a chave privada Ed25519 do disco (cifrada com a password).
-          3. Assina o desafio com Ed25519 — prova de posse sem revelar segredo.
-          4. Envia a assinatura cifrada para o servidor.
-          5. O servidor verifica a assinatura e emite JWT apenas se válida.
         """
         if self._token is not None or self._username_atual is not None:
             return {"status": "error", "reason": "Já existe uma sessão ativa. Faça logout primeiro."}
@@ -507,17 +484,14 @@ class ClienteWS:
 
         challenge = bytes.fromhex(resp_ch["challenge"])
 
-        # Passo 2: carregar estado do disco (valida a password localmente)
         try:
             (identity_priv, auth_priv, sessions, trusted_keys,
              my_cert, ca_local, groups) = carregar_estado_local(username, password)
         except ValueError as e:
             return {"status": "error", "reason": str(e)}
 
-        # Passo 3: assinar o desafio com Ed25519 — sem envolver a password
         signature = auth_priv.sign(challenge)
 
-        # Passo 4: enviar assinatura cifrada (confidencialidade em trânsito)
         pub, nonce, cifra = encriptar_payload(
             self.server_pub, {"signature": signature.hex()})
 
@@ -571,8 +545,14 @@ class ClienteWS:
             self._escuta_task.cancel()
             self._escuta_task = None
 
-        for peer, p2p_ws in self._p2p_peers.items():
+        if self._p2p_server:
+            self._p2p_server.close()
+            await self._p2p_server.wait_closed()
+            self._p2p_server = None
+
+        for p2p_ws in list(self._p2p_peers.values()):
             await p2p_ws.close()
+
         self._p2p_peers.clear()
         self._expected_p2p_tokens.clear()
 
@@ -581,13 +561,12 @@ class ClienteWS:
         except Exception:
             pass
 
-        # Limpar todas as variáveis sensíveis em memória
         self._token           = None
         self._username_atual  = None
         self._password_atual  = None
         self.identity_priv    = None
         self.identity_pub_hex = None
-        self.auth_priv        = None   # NOVO: limpar também a chave Ed25519
+        self.auth_priv        = None
         self.my_cert          = ""
         self.sessions.clear()
         self.groups.clear()
@@ -602,13 +581,6 @@ class ClienteWS:
     async def enviar_msg(self, token: str, to: str, texto: str) -> dict:
         """
         Envia mensagem direta a 'to'.
-
-        CORREÇÃO Vulnerabilidade 2 — Remoção total do TOFU:
-          Se o certificado PKI estiver ausente ou inválido, retorna erro.
-          Não existe fallback TOFU.
-
-        CORREÇÃO Vulnerabilidade 4 — Handshake sem static-static:
-          A sessão Ratchet é criada sem shared_secret estático.
         """
         if to in self._p2p_peers:
             return await self._enviar_p2p(to, texto)
@@ -681,26 +653,6 @@ class ClienteWS:
     async def criar_grupo(self, token: str, nome: str, membros: list) -> dict:
         """
         Cria um grupo de mensagens.
-
-        CORREÇÃO Vulnerabilidade 3 — Forward Secrecy em Grupos (sem pré-requisito):
-          A group_key é cifrada para cada membro com ECDH efémero dedicado,
-          usando cifrar_chave_grupo() de common/crypto.py.
-
-          Por que isto resolve o problema sem exigir sessão Ratchet prévia:
-            • Para cada membro, gera-se um par X25519 efémero ONE-SHOT.
-              O shared secret é calculado como  eph_priv × member_static_pub.
-            • A chave efémera é descartada imediatamente após produzir o
-              key_share — não é armazenada em lado algum.
-            • Comprometer a chave estática do membro no futuro dá acesso
-              ao shared secret dessa troca, mas as group_keys de grupos
-              entretanto destruídos ou renovados permanecem inacessíveis
-              (o efémero já não existe).
-            • Não há dependência de estado de chat prévio: funciona para
-              qualquer par de utilizadores registados, como no Signal/WhatsApp.
-
-          Distinção face à vulnerabilidade original (static-static):
-            Original:  shared = creator_static × member_static  — ambas permanentes
-            Corrigido: shared = eph_one_shot   × member_static  — eph descartada
         """
         group_key  = os.urandom(32)
         key_shares = {}

@@ -24,7 +24,8 @@ Comandos disponíveis:
   group create <nome> <m1> [m2]..  -- criar grupo com membros
   group list                       -- listar os teus grupos
   group msg <nome_grupo> <texto>   -- enviar mensagem ao grupo
-  p2p start [porta]                -- iniciar servidor P2P local (default 9000)
+  p2p start [porta]                -- iniciar servidor P2P local
+  p2p stop                         -- parar o servidor P2P local
   p2p invite <peer> [porta]        -- convidar peer para ligação P2P direta
   ajuda                            -- mostrar esta ajuda
   sair
@@ -59,23 +60,22 @@ async def main():
                     pw = await asyncio.get_event_loop().run_in_executor(
                         None, getpass.getpass, "Password: ")
                     r = await c.registar(partes[1], pw)
-                    print(r)
+
 
             # ---- login ------------------------------------------------ #
                 elif cmd == "login" and len(partes) == 2:
                     pw = await asyncio.get_event_loop().run_in_executor(
                         None, getpass.getpass, "Password: ")
                     r = await c.login(partes[1], pw)
-                    print(r)
                     if r.get("status") == "ok":
                         token = r["token"]
                 else:
                     print("[ERRO] Comando não reconhecido ou precisa de estar autenticado.")
-                    print("Tente /login ou /register")
+                    print("Tente login ou register")
             else:
 
                 if cmd == "login" or cmd == "register":
-                    print("[ERRO] Já tem uma sessão ativa. Escreva /logout primeiro.")
+                    print("[ERRO] Já tem uma sessão ativa. Escreva logout primeiro.")
 
                 elif cmd == "logout":
                     resposta = await c.logout()
@@ -150,17 +150,26 @@ async def main():
                     sub = partes[1].lower()
 
                     if sub == "start":
-                        porta = int(partes[2]) if len(partes) >= 3 else 9000
+                        porta = int(partes[2]) if len(partes) >= 3 else 0
                         await c.iniciar_p2p_server(porta)
+
+                    elif sub == "stop":
+                        r = await c.parar_p2p_server()
+                        print(f"[P2P] {r.get('message', r.get('reason'))}")
 
                     elif sub == "invite" and len(partes) >= 3:
                         peer  = partes[2]
-                        porta = int(partes[3]) if len(partes) >= 4 else 9000
-                        r     = await c.convidar_p2p(token, peer, porta)
-                        if r.get("status") == "ok":
-                            print(f"[P2P] Convite enviado a '{peer}'.")
+                        if len(partes) >= 4:
+                            porta_invite = int(partes[3])
                         else:
-                            print(f"[ERRO] {r.get('reason')}")
+                            porta_invite = c._p2p_port
+
+                        if porta_invite == 0:
+                            print("[P2P] Erro: O servidor P2P não está a correr. Use 'p2p start' primeiro.")
+                            continue
+
+                        resp = await c.convidar_p2p(token, peer, porta_invite)
+                        print(f"[P2P] {resp.get('message', resp.get('status'))}")
                     else:
                         print("Uso: p2p start [porta] | p2p invite <peer> [porta]")
 

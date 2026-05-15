@@ -6,19 +6,6 @@ Funções criptográficas e de persistência do lado do cliente.
 Inclui:
   - Inicialização de sessão Double Ratchet entre dois peers
   - Guardar / carregar o estado local cifrado em disco
-
-CORREÇÕES:
-  Vulnerabilidade 1 — Pass-the-Hash / Autenticação insegura:
-    O estado persistido inclui agora a chave privada Ed25519 de autenticação
-    (auth_priv). Esta chave é DISTINTA da chave X25519 de chat (identity_priv)
-    e serve exclusivamente para assinar o desafio de login. A chave pública
-    correspondente é registada no servidor durante o registo.
-
-  Vulnerabilidade 4 — Falta de Forward Secrecy no Handshake Inicial:
-    A função iniciar_sessao_ratchet deixa de receber um 'shared_secret'
-    calculado externamente. O RatchetState gera internamente o par efémero
-    (iniciador) ou usa a chave estática (recetor), garantindo que o primeiro
-    passo DH nunca usa static-static X25519.
 """
 
 import os
@@ -45,13 +32,6 @@ def iniciar_sessao_ratchet(my_username: str,
                             is_initiator: bool) -> RatchetState:
     """
     Cria um RatchetState para a sessão entre 'my_username' e 'peer_username'.
-
-    CORREÇÃO Vulnerabilidade 4:
-      O shared_secret inicial deixa de ser calculado aqui com static-static
-      X25519. Em vez disso, passa-se shared_secret=b'\\x00'*32 como semente
-      nula — o RatchetState irá sobrepô-la imediatamente no primeiro passo DH
-      efémero (iniciador) ou aguardará o eph_pub do peer (recetor).
-      O root_key real é assim sempre derivado de pelo menos uma chave efémera.
     """
     return RatchetState(
         shared_secret       = bytes(32),   # semente nula; sobreposta no 1.º DH
@@ -76,11 +56,6 @@ def guardar_estado_local(username: str,
     Serializa e cifra o estado do cliente (chaves, sessões, grupos)
     para 'estado_<username>.bin'.
     A chave de cifragem é derivada da password via PBKDF2.
-
-    CORREÇÃO Vulnerabilidade 1:
-      O campo 'auth_priv' (Ed25519) é agora persistido juntamente com a
-      chave de chat X25519 ('identity_priv'). Ambas são cifradas com a
-      mesma KEK derivada da password — nunca são guardadas em claro.
     """
     identity_priv_hex = identity_priv.private_bytes(
         serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
@@ -118,10 +93,6 @@ def carregar_estado_local(username: str, password: str) -> tuple:
     Devolve:
       (identity_priv, auth_priv, sessions, trusted_keys,
        my_cert, ca_pub_hex, groups)
-
-    CORREÇÃO Vulnerabilidade 1:
-      Devolve também 'auth_priv' (Ed25519) para que o ClienteWS possa
-      assinar o desafio de login sem recalcular a chave.
 
     Levanta ValueError se o ficheiro não existir ou a password for incorreta.
     """

@@ -7,22 +7,6 @@ Todas as funções recebem explicitamente o estado de que precisam
 (users_db, active_challenges, …) em vez de o lerem de globais,
 tornando-as mais fáceis de testar isoladamente.
 
-CORREÇÕES:
-  Vulnerabilidade 1 — Pass-the-Hash / Autenticação insegura:
-    O servidor deixa de armazenar um hash PBKDF2 da password e de verificar
-    uma resposta HMAC. Em vez disso:
-      • Registo: o cliente envia a sua chave pública Ed25519 de autenticação
-        (auth_pub_key). O servidor guarda apenas esta chave pública.
-      • Login:   o servidor emite um desafio aleatório de 32 bytes; o cliente
-        assina-o com a sua chave privada Ed25519; o servidor verifica a
-        assinatura com a chave pública registada.
-    Desta forma, o servidor NUNCA tem acesso ao segredo do utilizador —
-    mesmo um servidor comprometido não pode fazer impersonation.
-
-  Vulnerabilidade 5 — PKI não usada para autorização:
-    O JWT é emitido apenas após verificação bem-sucedida da assinatura Ed25519,
-    vinculando criptograficamente a identidade do utilizador ao token emitido.
-    O campo 'auth_pub_key' em users_db é o âncora de identidade.
 """
 
 import os
@@ -68,14 +52,6 @@ def handle_register(msg: dict,
                     salvar_fn) -> dict:
     """
     Regista um novo utilizador.
-
-    CORREÇÃO Vulnerabilidade 1:
-      O payload cifrado deve conter:
-        • 'auth_pub_key'  — chave pública Ed25519 de autenticação (hex)
-        • 'chat_pub_key'  — chave pública X25519 de chat (hex)
-      O servidor NÃO recebe nem armazena qualquer derivado da password.
-
-    'salvar_fn' é chamada sem argumentos para persistir o estado após sucesso.
     """
     username = msg.get("username", "").strip()
     if not username:
@@ -118,10 +94,6 @@ def handle_get_challenge(msg: dict,
     """
     Emite um desafio aleatório de 32 bytes para o processo de login.
 
-    CORREÇÃO Vulnerabilidade 1:
-      O servidor deixa de devolver o 'salt' (que já não existe).
-      O desafio é o único dado enviado — o cliente deve assiná-lo com
-      a sua chave privada Ed25519.
     """
     username = msg.get("username", "")
     if username not in users_db:
@@ -143,15 +115,6 @@ def handle_login(msg: dict,
     """
     Valida a assinatura Ed25519 sobre o desafio e emite um JWT.
 
-    CORREÇÃO Vulnerabilidade 1 + 5:
-      Em vez de verificar um HMAC calculado com um hash da password,
-      o servidor:
-        1. Recupera a chave pública Ed25519 registada para o utilizador.
-        2. Verifica a assinatura Ed25519 sobre o desafio recebido.
-        3. Só então emite o JWT — vinculando o token à identidade criptográfica.
-
-      O payload cifrado deve conter:
-        • 'signature' — assinatura Ed25519 do desafio (hex)
     """
     username = msg.get("username", "")
     if username not in users_db or username not in active_challenges:
@@ -174,8 +137,6 @@ def handle_login(msg: dict,
             bytes.fromhex(users_db[username]["auth_pub_key"]))
         auth_pub.verify(bytes.fromhex(signature_hex), challenge)
     except (InvalidSignature, Exception):
-        # Não distinguimos "assinatura inválida" de "chave mal formada"
-        # para não vazar informação sobre o estado interno.
         return {"status": "error", "reason": "Credenciais inválidas."}
 
     print(f"[SERVIDOR] Login (Ed25519 verificado): '{username}'")
